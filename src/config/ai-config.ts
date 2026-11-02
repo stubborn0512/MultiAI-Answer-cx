@@ -20,6 +20,15 @@ export const AI_PROVIDERS: readonly ProviderConfig[] = [
     enabled: true,
   },
   {
+    id: 'chatgpt',
+    name: 'ChatGPT',
+    domain: 'chatgpt.com',
+    color: '#10A37F',
+    iconPath: 'icons/icon.png',
+    weight: 1.0,
+    enabled: true,
+  },
+  {
     id: 'doubao',
     name: '豆包',
     domain: 'doubao.com',
