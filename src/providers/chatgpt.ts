@@ -27,32 +27,7 @@ export class ChatGPTProvider extends BaseProvider {
     try {
       const prompt = this.buildPrompt(questions);
       const tabId = await this.ensureChatGPTTab();
-
-      const apiResults = await chrome.scripting.executeScript({
-        target: { tabId },
-        world: 'MAIN',
-        func: chatgptApiQuery,
-        args: [prompt],
-      });
-
-      const apiResult = apiResults[0]?.result as
-        | { ok: true; text: string }
-        | { ok: false; error: string; is403: boolean }
-        | undefined;
-
-      if (!apiResult) throw new Error('ChatGPT: executeScript 无返回');
-
-      if (apiResult.ok) {
-        const rawText = apiResult.text;
-        const parsed = parseAIResponse(rawText, this.config.id);
-        return { ...parsed, rawText };
-      }
-
-      if (!apiResult.is403) {
-        return { providerId: this.config.id, answers: [], rawText: '', error: apiResult.error };
-      }
-
-      console.warn('[ChatGPT] API 403 — falling back to DOM simulation');
+      // Use the visible composer to send into the existing conversation.
       return await this.queryViaDom(prompt, tabId);
     } catch (error) {
       return {
@@ -64,7 +39,7 @@ export class ChatGPTProvider extends BaseProvider {
     }
   }
 
-  private async queryViaDom(prompt: string, tabId: number): Promise<ProviderResponse> {
+  private async queryViaDom  private async queryViaDom(prompt: string, tabId: number): Promise<ProviderResponse> {
     const sendResults = await chrome.scripting.executeScript({
       target: { tabId },
       world: 'MAIN',
@@ -122,21 +97,32 @@ export class ChatGPTProvider extends BaseProvider {
   }
 
   private async ensureChatGPTTab(): Promise<number> {
+    // Prefer the focused ChatGPT tab to preserve the current conversation.
+    const activeTabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    const active = activeTabs.find((tab) => {
+      if (!tab.url || tab.id === undefined) return false;
+      try {
+        const host = new URL(tab.url).hostname;
+        return host === 'chatgpt.com' || host === 'chat.openai.com';
+      } catch {
+        return false;
+      }
+    });
+    if (active?.id !== undefined) return active.id;
+
     for (const pattern of ['https://chatgpt.com/*', 'https://chat.openai.com/*']) {
       const tabs = await chrome.tabs.query({ url: pattern });
-      const tab = tabs.find((t) => t.id !== undefined);
+      const tab = tabs.find((item) => item.id !== undefined);
       if (tab?.id !== undefined) return tab.id;
     }
 
-    const tab = await createGroupedTab({ url: 'https://chatgpt.com/', active: false });
+    const tab = await createGroupedTab({ url: 'https://chatgpt.com/', active: true });
     if (tab.id === undefined) throw new Error('ChatGPT: chrome.tabs.create 无 id');
-
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => {
         chrome.tabs.onUpdated.removeListener(listener);
         reject(new Error('ChatGPT: tab 加载超时'));
-      }, 15_000);
-
+      }, 20_000);
       function listener(id: number, info: chrome.tabs.TabChangeInfo) {
         if (id === tab.id && info.status === 'complete') {
           clearTimeout(timer);
@@ -146,182 +132,60 @@ export class ChatGPTProvider extends BaseProvider {
       }
       chrome.tabs.onUpdated.addListener(listener);
     });
-
     return tab.id;
   }
 }
 
 // ---------------------------------------------------------------------------
-// All functions below run inside chatgpt.com MAIN world via executeScript.
-// They MUST be fully self-contained — no outer-scope references allowed.
+// These functions run inside chatgpt.com MAIN world via executeScript.
+// They must be self-contained because Chrome serializes them into the page.
 // ---------------------------------------------------------------------------
 
-// Adapted from openclaw-zero-token + ChatALL ChatGPTBot.
-// Flow: session → sentinel chat-requirements → /backend-api/conversation SSE.
-function chatgptApiQuery(
-  message: string,
-): Promise<{ ok: true; text: string } | { ok: false; error: string; is403: boolean }> {
-  return (async () => {
-    try {
-      console.log('[ChatGPT API] fetching session');
-      const sessionRes = await fetch('https://chatgpt.com/api/auth/session', {
-        credentials: 'include',
-      });
-      console.log('[ChatGPT API] session status:', sessionRes.status);
-      if (!sessionRes.ok) {
-        return { ok: false as const, error: `ChatGPT session ${sessionRes.status}`, is403: false };
-      }
-      const session = (await sessionRes.json()) as {
-        accessToken?: string;
-        oaiDeviceId?: string;
-      };
-      const accessToken = session.accessToken;
-      if (!accessToken) {
-        return {
-          ok: false as const,
-          error: 'ChatGPT: 未找到 accessToken — 请先登录 chatgpt.com',
-          is403: false,
-        };
-      }
-      const deviceId = session.oaiDeviceId ?? crypto.randomUUID();
+async function chatgptDomSend(message: string): Promise<{ ok: boolean; error?: string }> {
+  const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+  const normalize = (value: string): string =>
+    value.replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/\s+/g, ' ').trim();
 
-      const baseHeaders: Record<string, string> = {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${accessToken}`,
-        'oai-device-id': deviceId,
-        'oai-language': 'en-US',
-      };
+  const selectors = [
+    '#prompt-textarea',
+    'textarea[placeholder]',
+    'textarea',
+    '[contenteditable="true"][data-placeholder]',
+    '[contenteditable="true"]',
+    'div[role="textbox"]',
+  ];
 
-      let sentinelToken = '';
-      try {
-        console.log('[ChatGPT API] fetching sentinel requirements');
-        const sentinelRes = await fetch(
-          'https://chatgpt.com/backend-api/sentinel/chat-requirements',
-          {
-            method: 'POST',
-            headers: baseHeaders,
-            credentials: 'include',
-          },
-        );
-        console.log('[ChatGPT API] sentinel status:', sentinelRes.status);
-        if (sentinelRes.ok) {
-          const data = (await sentinelRes.json()) as { token?: string };
-          sentinelToken = data.token ?? '';
-        }
-      } catch (e: unknown) {
-        console.log('[ChatGPT API] sentinel fetch error:', e instanceof Error ? e.message : String(e));
-      }
-
-      const headers: Record<string, string> = {
-        ...baseHeaders,
-        Accept: 'text/event-stream',
-      };
-      if (sentinelToken) {
-        headers['openai-sentinel-chat-requirements-token'] = sentinelToken;
-      }
-
-      const body = {
-        action: 'next',
-        messages: [
-          {
-            id: crypto.randomUUID(),
-            author: { role: 'user' },
-            content: { content_type: 'text', parts: [message] },
-          },
-        ],
-        parent_message_id: crypto.randomUUID(),
-        model: 'auto',
-        timezone_offset_min: new Date().getTimezoneOffset(),
-        history_and_training_disabled: false,
-        conversation_mode: { kind: 'primary_assistant' },
-        force_paragen: false,
-        force_use_sse: true,
-      };
-
-      console.log('[ChatGPT API] posting conversation');
-      const res = await fetch('https://chatgpt.com/backend-api/conversation', {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(body),
-        credentials: 'include',
-      });
-      console.log('[ChatGPT API] conversation status:', res.status);
-
-      if (!res.ok) {
-        const errText = await res.text();
-        const is403 = res.status === 403;
-        return {
-          ok: false as const,
-          error: `ChatGPT API ${res.status}: ${errText.slice(0, 300)}`,
-          is403,
-        };
-      }
-
-      const sse = await res.text();
-      let lastText = '';
-      for (const line of sse.split('\n')) {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith('data:')) continue;
-        const payload = trimmed.slice(5).trim();
-        if (!payload || payload === '[DONE]') continue;
-
-        try {
-          const data = JSON.parse(payload) as {
-            message?: {
-              content?: {
-                content_type?: string;
-                parts?: string[];
-              };
-            };
-          };
-          if (data.message?.content?.content_type === 'text') {
-            const part = data.message.content.parts?.[0];
-            if (typeof part === 'string') {
-              lastText = part;
-            }
-          }
-        } catch {}
-      }
-
-      if (!lastText) {
-        return {
-          ok: false as const,
-          error: `ChatGPT: SSE 响应中无文本内容 (len=${sse.length})`,
-          is403: false,
-        };
-      }
-      return { ok: true as const, text: lastText };
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : String(e);
-      return { ok: false as const, error: msg, is403: msg.includes('403') };
-    }
-  })();
-}
-
-function chatgptDomSend(message: string): { ok: boolean; error?: string } {
   try {
-    const inputSelectors = [
-      '#prompt-textarea',
-      'textarea[placeholder]',
-      'textarea',
-      '[contenteditable="true"][data-placeholder]',
-      '[contenteditable="true"]',
-      'div[role="textbox"]',
-    ];
     let inputEl: HTMLElement | null = null;
-    for (const sel of inputSelectors) {
-      inputEl = document.querySelector(sel);
-      if (inputEl && inputEl.offsetParent !== null) break;
+    for (const selector of selectors) {
+      const candidates = document.querySelectorAll<HTMLElement>(selector);
+      inputEl = Array.from(candidates).find((el) => el.getClientRects().length > 0) ?? null;
+      if (inputEl) break;
     }
-    if (!inputEl) return { ok: false, error: '找不到输入框 — 请在 chatgpt.com 打开一个对话页面' };
+    if (!inputEl) return { ok: false, error: '找不到当前会话输入框，请先打开 ChatGPT 对话页面' };
 
+    const beforeCount = document.querySelectorAll('[data-message-author-role="user"]').length;
     inputEl.focus();
-    if (inputEl.tagName === 'TEXTAREA' || inputEl.tagName === 'INPUT') {
-      (inputEl as HTMLTextAreaElement).value = message;
-      inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+
+    if (inputEl instanceof HTMLTextAreaElement || inputEl instanceof HTMLInputElement) {
+      const proto = inputEl instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+      if (!setter) return { ok: false, error: '无法更新 ChatGPT 输入框' };
+      setter.call(inputEl, message);
+      inputEl.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: message }));
+      inputEl.dispatchEvent(new Event('change', { bubbles: true }));
     } else {
-      inputEl.textContent = message;
-      inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+      // Use the editing command so React receives the contenteditable input event path.
+      const selection = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(inputEl);
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+      const inserted = document.execCommand('insertText', false, message);
+      if (!inserted || normalize(inputEl.innerText || inputEl.textContent || '') !== normalize(message)) {
+        inputEl.replaceChildren(document.createTextNode(message));
+        inputEl.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: message }));
+      }
     }
 
     const sendSelectors = [
@@ -329,38 +193,72 @@ function chatgptDomSend(message: string): { ok: boolean; error?: string } {
       'button[data-testid="send-button"]',
       'button[aria-label*="Send"]',
       'button[aria-label*="send"]',
+      'form button[type="submit"]',
       'button[type="submit"]',
-      'form button[type=submit]',
     ];
-    let sendBtn: HTMLElement | null = null;
-    for (const sel of sendSelectors) {
-      sendBtn = document.querySelector(sel);
-      if (sendBtn && !(sendBtn as HTMLButtonElement).disabled) break;
+    let sendButton: HTMLButtonElement | null = null;
+    for (let attempt = 0; attempt < 24; attempt++) {
+      for (const selector of sendSelectors) {
+        const candidates = document.querySelectorAll<HTMLButtonElement>(selector);
+        sendButton = Array.from(candidates).find((button) =>
+          button.getClientRects().length > 0 &&
+          !button.disabled &&
+          button.getAttribute('aria-disabled') !== 'true',
+        ) ?? null;
+        if (sendButton) break;
+      }
+      if (sendButton) break;
+      await sleep(150);
     }
 
-    if (sendBtn) {
-      sendBtn.click();
-      return { ok: true };
+    const pressEnter = (): void => {
+      inputEl?.focus();
+      inputEl?.dispatchEvent(new KeyboardEvent('keydown', {
+        key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
+        bubbles: true, cancelable: true,
+      }));
+      inputEl?.dispatchEvent(new KeyboardEvent('keyup', {
+        key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
+        bubbles: true, cancelable: true,
+      }));
+    };
+
+    if (sendButton) sendButton.click();
+    else pressEnter();
+
+    const hasNewUserTurn = (): boolean => {
+      const turns = Array.from(document.querySelectorAll<HTMLElement>('[data-message-author-role="user"]'));
+      if (turns.length > beforeCount) return true;
+      const prefix = normalize(message.slice(0, 80));
+      return !!prefix && turns.some((turn) =>
+        normalize(turn.innerText || turn.textContent || '').includes(prefix),
+      );
+    };
+
+    const waitForTurn = async (timeout: number): Promise<boolean> => {
+      const started = Date.now();
+      while (Date.now() - started < timeout) {
+        if (hasNewUserTurn()) return true;
+        await sleep(250);
+      }
+      return false;
+    };
+
+    let sent = await waitForTurn(8_000);
+    if (!sent && sendButton) {
+      pressEnter();
+      sent = await waitForTurn(8_000);
     }
 
-    const formSubmit = inputEl.closest('form')?.querySelector('button[type=submit]');
-    if (formSubmit) {
-      (formSubmit as HTMLElement).click();
-      return { ok: true };
+    if (!sent) {
+      return {
+        ok: false,
+        error: '题目已填入输入框，但没有检测到新消息进入当前会话；本次不会误报发送成功。',
+      };
     }
-
-    inputEl.dispatchEvent(
-      new KeyboardEvent('keydown', {
-        key: 'Enter',
-        code: 'Enter',
-        keyCode: 13,
-        which: 13,
-        bubbles: true,
-      }),
-    );
     return { ok: true };
-  } catch (e: unknown) {
-    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  } catch (error: unknown) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }
 }
 
